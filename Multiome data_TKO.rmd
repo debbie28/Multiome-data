@@ -1,0 +1,449 @@
+---
+title: "Multiome analysis"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Signac)
+library(Seurat)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(JASPAR2020)
+library(TFBSTools)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(patchwork)
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+library(matrixStats)
+
+# load the RNA and ATAC data
+counts <- Read10X_h5("/labs/julsage/Debbie/multiome_data/M1/outs/filtered_feature_bc_matrix.h5")
+fragpath <- "labs/julsage/Debbie/multiome_data/M1/outs/atac_fragments.tsv.gz"
+
+#get annotation
+#there is a bug in the EnsDb.Mmusculus.v79, so had to correct annotation style to UCSC in a slightly complicated way
+
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+ucsc.levels <- str_replace(string=paste("chr",seqlevels(annotation),sep=""), pattern="chrMT", replacement="chrM")
+seqlevels(annotation) <- ucsc.levels
+seqlevelsStyle(annotation) <- "UCSC"
+genome(annotation) <- "mm10"
+
+# create a Seurat object containing the RNA adata
+TKO <- CreateSeuratObject(
+  counts = counts$`Gene Expression`,
+  assay = "RNA"
+)
+
+# create ATAC assay and add it to the object
+TKO[["ATAC"]] <- CreateChromatinAssay(
+  counts = counts$Peaks,
+  sep = c(":", "-"),
+  fragments = fragpath,
+  annotation = annotation
+)
+
+DefaultAssay(pbmc) <- "ATAC"
+
+TKO <- NucleosomeSignal(TKO)
+TKO <- TSSEnrichment(TKO)
+
+VlnPlot(
+  object = TKO,
+  features = c("nCount_RNA", "nCount_ATAC", "TSS.enrichment", "nucleosome_signal"),
+  ncol = 4,
+  pt.size = 0
+)
+
+# filter out low quality cells
+TKO <- subset(
+  x = TKO,
+  subset = nCount_ATAC < 100000 &
+    nCount_RNA < 25000 &
+    nCount_ATAC > 1000 &
+    nCount_RNA > 500 &
+    nucleosome_signal < 2 )
+
+```
+
+
+```{r}
+#recalLing peaks
+DefaultAssay(TKO) <- "ATAC"
+peaks <- CallPeaks(TKO, macs2.path = "/scg/apps/software/macs2/2.2.71/bin/macs2", group.by = "seurat_clusters")
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+
+#quantify counts in each peak
+macs2_counts <- FeatureMatrix(fragments = Fragments(TKO),
+  features = peaks,
+  cells = colnames(TKO))
+
+TKO[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = TKO_fragpath,
+  annotation = annotation
+)
+  
+  
+```
+
+
+```{r}
+# ATAC normalization
+DefaultAssay(TKO) <- "peaks"
+TKO<- FindTopFeatures(TKO, min.cutoff = 5)
+TKO <- RunTFIDF(TKO)
+TKO <- RunSVD(TKO)
+
+saveRDS(TKO,"TKO.rds")
+```
+```{r}
+#dimentionality reduction of ATAC data
+TKO <- RunUMAP(object = TKO, reduction = 'lsi', dims = 2:30)
+TKO <- FindNeighbors(object = TKO, reduction = 'lsi', dims = 2:30)
+TKO <- FindClusters(object = TKO, verbose = FALSE, algorithm = 3, resolution = 0.5)
+DimPlot(object = TKO, label = TRUE) + NoLegend()
+
+#RNA
+DefaultAssay(TKO) <- "RNA"
+# store mitochondrial percentage in object meta data
+TKO <- PercentageFeatureSet(TKO, pattern = "mt-", col.name = "percent.mt")
+
+# run sctransform
+BiocManager::install("glmGamPoi")
+TKO <- SCTransform(TKO, vars.to.regress = "percent.mt", verbose = FALSE,method = "glmGamPoi")
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+TKO <- RunPCA(TKO, verbose = FALSE)
+TKO <- RunUMAP(TKO, dims = 1:30, verbose = FALSE)
+
+TKO <- FindNeighbors(TKO, dims = 1:30)
+TKO <- FindClusters(TKO)
+
+
+#JOINT umap
+
+# build a joint neighbor graph using both assays
+TKO <- FindMultiModalNeighbors(
+  object = TKO,
+  reduction.list = list("pca", "lsi"), 
+  dims.list = list(1:30, 2:30),
+  modality.weight.name = "RNA.weight",
+  verbose = TRUE
+)
+
+# build a joint UMAP visualization
+TKO <- RunUMAP(
+  object = TKO,
+  nn.name = "weighted.nn",
+  assay = "SCT",
+  verbose = TRUE
+)
+
+DimPlot(TKO, reduction = "umap",pt.size =0.2, cols = c("#D12A06","#5D7DF7","#F4AE0D","#9BCA07","#943FCC","#F509D5","#CA076E","#0696D5","#049843","#0EC6C6","#59A981","#0E6FC6","#FF0725","#B7BD07","#F15A5F","#E95B5F"))
+
+
+TKO <- RenameIdents(object = TKO, `0` = "NE_1",`1` = "Club cells_1",`2`= "NE_2",`3`="NE_3",`4` ="NE_4",`5`= "NE_5",`6`= "NE_6",`7` ="Club cell_2", `8`= "NFIB high_NE", `9` = "Club cells_3", `10`= "NE_7", `11` = "AT2 cells", `12` = "NE_8", `13` = "Cilliated cells", `14` = "Endothelial cells", `15` = "Stromal cells")
+```
+
+
+```{r cars}
+#Including motif information
+# Get a list of motif position frequency matrices from the JASPAR database
+pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+# add motif information
+TKO <- AddMotifs(
+  object = TKO,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  pfm = pfm
+)
+
+#computing motif activities
+TKO <- RunChromVAR(
+  object = TKO,
+  genome = BSgenome.Mmusculus.UCSC.mm10
+)
+#finding specific markers
+DefaultAssay(TKO) <- "chromvar"
+
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+TKO_motif_markers <- FindAllMarkers(TKO, only.pos = TRUE, min.pct = 0.05, logfc.threshold = 0.5)
+TKO_motif_markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 2, order_by = avg_log2FC)
+
+#Doing this just to get a full list of motif names
+da_peaks <- FindMarkers(
+  object = TKO,
+  ident.1 = "NE_1",
+  only.pos = TRUE,
+  test.use = 'LR',
+  min.pct = 0.05)
+
+ top.da.peak <- rownames(da_peaks[da_peaks$p_val < 0.005, ])
+# test enrichment
+enriched.motifs <- FindMotifs(
+  object = TKO,
+  features = top.da.peak 
+)
+ shared_motifs = enriched.motifs[enriched.motifs$motif %in% TKO_motif_markers$gene,]
+ colnames(TKO_motif_markers)[7]= "motif"
+ TKO_motifs_labelled = merge( TKO_motif_markers, shared_motifs, by = "motif")
+ TKO_motifs_labelled =TKO_motifs_labelled[,-c(8:13)]
+ write.csv(TKO_motifs_labelled, "TKO_motifs_labelled.csv")
+```
+
+
+
+
+
+```{r}
+#ASCL1
+p1 = FeaturePlot(
+  object = TKO,
+  features = "MA1631.1",
+  min.cutoff = 1,
+  max.cutoff = 5.5,
+  pt.size = 0.1, cols = c("lightgrey","#6605A9")
+) 
+
+p1
+
+```
+```{r}
+#NFIB
+p2 = FeaturePlot(
+  object = TKO,
+  features = "MA1643.1",
+  min.cutoff = 1,
+  max.cutoff = 6,
+  pt.size = 0.1,
+  cols = c("lightgrey","red")
+)
+p2
+
+
+
+```
+
+```{r}
+#Tead1
+p6 = FeaturePlot(
+  object = TKO,
+  features = "MA0090.3",
+  min.cutoff = 1,
+  max.cutoff = 7.5,
+  pt.size = 0.1, cols = c("lightgrey","#6605A9")
+)
+p6
+
+
+```
+
+```{r}
+#Neurod1
+p3 = FeaturePlot(
+  object = TKO,
+  features = "MA1109.1",
+  min.cutoff = 'q10',
+  max.cutoff = 'q95',
+  pt.size = 0.1
+)
+p3
+```
+
+
+```{r}
+FeaturePlot(
+  object = TKO,
+  features = "MA0059.1",
+  min.cutoff = 'q10',
+  max.cutoff = 'q90',
+  pt.size = 0.1
+)
+
+FeaturePlot(
+  object = TKO,
+  features = "MA0098.3",
+  min.cutoff = 'q10',
+  max.cutoff = 'q90',
+  pt.size = 0.1
+)
+```
+
+
+```{r}
+DefaultAssay(TKO) <- "SCT"
+
+features_2 <- c("Lyz2", "Calca", "Sftpc","Scgb1a1","Cyp2s1","Ncam1","Ddc")
+features_3 = c("Calca","Ascl1","Chga","Ddc")
+NE = DotPlot(TKO, features = c("Ncam1","Calca","Ascl1","Ddc","Sftpc","Scgb1a1","Nfib"), scale.by = "size", scale.max = 30, col.max = 2, col.min = -1) + scale_colour_gradient2(low = "#2166ac", mid = "#f7f7f7", high = "#b2182b")+ RotatedAxis()+NoLegend()
+
+Non_NE = DotPlot(TKO, features = c("Fmo3","Pdpn","Clic5","Ager","Aqp5","Lyz2","Sftpc","Icam1","Scgb1a1","Nfib"), scale.by = "size",col.max = 2.5, scale.max = 50)+ RotatedAxis() +NoLegend()
+
+p10 <- DotPlot(TKO, features = c("Rbpj","Notch2","Ascl1","Yap1","Hes1","Rest"), scale.by = "size")+ RotatedAxis()+coord_flip() +  scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "Spectral")))
+
+
+p7 <-FeaturePlot(
+  object = TKO,
+  features = "Yap2",
+  pt.size = 0.1,
+  max.cutoff = 0.25,
+  min.cutoff = -2.5, cols = c("lightgrey","#0404EC")
+)
+
+```
+```{r}
+#Find markers RNA
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+TKO.markers_genes <- FindAllMarkers(TKO, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+TKO.markers_genes %>%
+    group_by(cluster) %>%
+    slice_max(n = 2, order_by = avg_log2FC)
+write.csv(TKO.markers_genes, "TKO.markers_genes.csv")
+```
+```{r}
+#Cell cycle score
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can
+# segregate this list into markers of G2/M phase and markers of S phase
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+TKO <- CellCycleScoring(TKO, s.features = s.genes_1, g2m.features = g2m.genes_1, set.ident = TRUE)
+
+# view cell cycle scores and phase assignments
+head(TKO[[]])
+TKO <- ScaleData(TKO, features = g2m.genes_1)
+TKO <- ScaleData(TKO, features = s.genes_1)
+
+TKO <- RunPCA(TKO, features = c(s.genes_1, g2m.genes_1))
+DimPlot(TKO,reduction = "umap")
+
+TKO$CC.Difference <- TKO$S.Score - TKO$G2M.Score
+TKO <- ScaleData(TKO, vars.to.regress = "CC.Difference", features = rownames(TKO))
+
+Idents(TKO) = "seurat_clusters"
+
+Cell_phase = table(Idents(TKO),TKO$Phase) 
+
+```
+```{r}
+
+
+```
+
+```{r}
+#subset
+
+TKO_NE = subset(TKO, idents = c("1", "2","3","4","5","7","9","10"))
+# ATAC normaliza_tion
+DefaultAssay(TKO_NE) <- "peaks"
+TKO_NE<- FindTopFeatures(TKO_NE, min.cutoff = 5)
+TKO_NE <- RunTFIDF(TKO_NE)
+TKO_NE <- RunSVD(TKO_NE)
+
+saveRDS(TKO,"TKO.rds")
+```
+```{r}
+#gene activity
+gene.activities <- GeneActivity(TKO)
+TKO[['gene_activity']] <- CreateAssayObject(counts = gene.activities)
+TKO <- NormalizeData(
+  object = TKO,
+  assay = 'gene_activity',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(TKO$nCount_gene_activity)
+)
+
+DefaultAssay(TKO) <-"gene_activity"
+```
+
+
+```{r}
+p3 = FeaturePlot(
+  object = TKO,
+  features = "Shh",
+  pt.size = 0.1,
+  max.cutoff = 1.25,
+  min.cutoff = -1.5, cols = c("lightgrey", "#F90707")
+)
+p9 <- FeaturePlot(
+  object = TKO,
+  features = "Yap1",
+  pt.size = 0.1,
+  max.cutoff = 1,
+  min.cutoff = -0,cols = c("lightgrey", "#F90707"))
+
+p11 = DotPlot(TKO, features = c("Rbpj","Notch2","Ascl1","Yap1","Hes1","Rest"), scale.by = "size")+ RotatedAxis() +coord_flip() +  scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "Spectral")))
+
+
+```
+
+```{r}
+#TF correlation plot
+#extracting top chromvar data from signac object cancer_2_h_new
+chromvar = data.frame(TKO@assays$chromvar@data) 
+#removing blacklist (repetitive motifs) This is optional and context specific. Do not start off by removing these motifs
+Blacklist_motif = c("MA1127.1","MA1126.1","MA1135.1","MA0489.1","MA1141.1","MA0478.1","MA0476.1","MA0491.2","MA0490.2","MA0496.3","MA1141.1","MA1128.1","MA0099.3","MA1634.1","MA0462.2","MA1633.1","MA1139.1","MA1136.1","MA1131.1","MA1133.1","MA1132.1","MA1130.1","MA1137.1","MA1138.1","MA1134.1","MA0841.1","MA0089.2","MA1121.1","MA0809.2","MA0808.1","MA1142.1","MA1144.1","MA0655.1","MA1101.2","MA0501.1","MA0119.1","MA0161.2","MA0671.1","MA1527.1","MA0653.1","MA1571.1","MA1572.1","MA0797.1","MA0157.2","MA0848.1","MA0593.1","MA0850.1","MA1487.1","MA0481.3","MA0479.1","MA0845.1","MA0852.2","MA1103.2","MA0848.1","MA0033.2","MA0042.2")
+chromvar_filt = chromvar[!rownames(chromvar) %in% Blacklist_motif,]
+chromvar_filt = data.frame(chromvar_filt)
+
+#calculating variance
+chromvar_filt$variance = rowVars(as.matrix(chromvar_filt))
+#filtering for top variable motifs
+Top_variance = subset(chromvar_filt, chromvar_filt$variance >= 2.5)
+#subsetting chromvar data frame for top varaible motifs
+chromvar_top = subset(chromvar_filt, rownames(chromvar_filt) %in% rownames(Top_variance))
+#removing column having variance values from subseted chromvar data frame
+chromvar_top = chromvar_top[,-2484]
+#calculating motif correlation
+chromvar_cor=cor(t(chromvar_top))
+#here I am renaming motifs so that instead of JASPAR no. the motif name shows up
+
+rownames_top = subset(TKO_motifs_labelled2, TKO_motifs_labelled2$motif %in% rownames(Top_variance))
+library(dplyr) 
+
+top_unique = rownames_top%>% distinct(motif, .keep_all= TRUE)
+rownames(top_unique) = top_unique$motif
+top_unique = top_unique[order(match(rownames(top_unique), rownames(chromvar_cor))),]
+rownames(chromvar_cor) = top_unique$motif.name
+colnames(chromvar_cor) = top_unique$motif.name
+#heatmap
+p13 = pheatmap(chromvar_cor,color = colorRampPalette(rev(brewer.pal(n = 11, name =
+                                                                "RdBu")))(100), border_color = NA, fontsize = 6)
+```
+
+
+
+
+
+
+```{r}
+
+`DefaultAssay<-`(TKO) <- "ATAC"
+#Transcription factor footprint
+TKO <- Footprint(
+  object = TKO,
+  motif.name = c("ASCL1", "SNAI1", "ZEB1"),
+  genome = BSgenome.Mmusculus.UCSC.mm10
+  
+  
+)
+
+```
+
+```{bash}
+git remote add origin https://github.com/debbie28/Multiome-data.git
+```
+
